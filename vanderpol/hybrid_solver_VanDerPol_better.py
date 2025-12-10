@@ -464,8 +464,8 @@ def plot_results(results):
 # Run everything
 if __name__ == "__main__":
     results = run_experiment(
-        mu=1.0,           
-        dt=0.05,          
+        mu=2.5,           
+        dt=0.25,          
         t_max=20.0,       
         n_samples=25000   
     )

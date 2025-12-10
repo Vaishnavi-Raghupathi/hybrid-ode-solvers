@@ -95,7 +95,7 @@ def generate_training_data_multi_trajectory(dt=0.01, t_max=10.0, n_samples=10000
     
     return dataset
 
-# Define Correction Neural Network - DEEPER for better learning
+# Define Correction Neural Network
 class CorrectionNetwork(nn.Module):
     """Correction network for Robertson problem"""
     def __init__(self, hidden_size=128):
@@ -161,10 +161,19 @@ def train_correction_network(dataset, epochs=400, batch_size=256, lr=0.001):
     
     return model, losses
 
-# Simple PINN
-class SimplePINN(nn.Module):
+# ============================================================================
+# TRUE PHYSICS-INFORMED NEURAL NETWORK (PINN) FOR ROBERTSON PROBLEM
+# ============================================================================
+
+class RobertsonPINN(nn.Module):
+    """
+    Physics-Informed Neural Network for Robertson problem
+    Network learns y(t) while respecting the Robertson chemistry equations
+    """
     def __init__(self, hidden_size=128):
         super().__init__()
+        
+        # Neural network: t -> [y1, y2, y3]
         self.net = nn.Sequential(
             nn.Linear(1, hidden_size),
             nn.Tanh(),
@@ -172,44 +181,191 @@ class SimplePINN(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_size, hidden_size),
             nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
             nn.Linear(hidden_size, 3)  # Output: [y1, y2, y3]
         )
-        
-    def forward(self, t):
-        return self.net(t)
-
-def train_pinn(t_true, y_true, epochs=1000, lr=0.001):
-    """Train PINN on trajectory data"""
-    model = SimplePINN(hidden_size=128)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
     
-    t_tensor = torch.tensor(t_true.reshape(-1, 1), dtype=torch.float32)
-    y_tensor = torch.tensor(y_true, dtype=torch.float32)
+    def forward(self, t):
+        """Forward pass through network"""
+        # Apply softmax-like scaling to encourage conservation
+        y = self.net(t)
+        # Use sigmoid to keep values between 0 and 1
+        y = torch.sigmoid(y)
+        return y
+
+
+def compute_robertson_physics_loss(model, t_physics):
+    """
+    Compute how well the network satisfies the Robertson ODE system
+    
+    Robertson equations:
+    - dy1/dt = -0.04*y1 + 1e4*y2*y3
+    - dy2/dt = 0.04*y1 - 1e4*y2*y3 - 3e7*y2^2
+    - dy3/dt = 3e7*y2^2
+    
+    We penalize deviations from these equations!
+    """
+    # Enable gradient computation for input
+    t_physics.requires_grad = True
+    
+    # Get network prediction
+    y_pred = model(t_physics)
+    y1 = y_pred[:, 0:1]
+    y2 = y_pred[:, 1:2]
+    y3 = y_pred[:, 2:3]
+    
+    # Compute derivatives using automatic differentiation
+    dy1_dt = torch.autograd.grad(
+        outputs=y1, 
+        inputs=t_physics,
+        grad_outputs=torch.ones_like(y1),
+        create_graph=True,
+        retain_graph=True
+    )[0]
+    
+    dy2_dt = torch.autograd.grad(
+        outputs=y2,
+        inputs=t_physics,
+        grad_outputs=torch.ones_like(y2),
+        create_graph=True,
+        retain_graph=True
+    )[0]
+    
+    dy3_dt = torch.autograd.grad(
+        outputs=y3,
+        inputs=t_physics,
+        grad_outputs=torch.ones_like(y3),
+        create_graph=True
+    )[0]
+    
+    # Physics residuals (how much we violate the Robertson ODEs)
+    # Equation 1: dy1/dt + 0.04*y1 - 1e4*y2*y3 = 0
+    physics_residual_1 = dy1_dt + 0.04 * y1 - 1e4 * y2 * y3
+    
+    # Equation 2: dy2/dt - 0.04*y1 + 1e4*y2*y3 + 3e7*y2^2 = 0
+    physics_residual_2 = dy2_dt - 0.04 * y1 + 1e4 * y2 * y3 + 3e7 * y2**2
+    
+    # Equation 3: dy3/dt - 3e7*y2^2 = 0
+    physics_residual_3 = dy3_dt - 3e7 * y2**2
+    
+    # We want these residuals to be ZERO (perfect physics satisfaction)
+    physics_loss = (torch.mean(physics_residual_1**2) + 
+                   torch.mean(physics_residual_2**2) + 
+                   torch.mean(physics_residual_3**2))
+    
+    return physics_loss
+
+
+def compute_robertson_conservation_loss(model, t_physics):
+    """
+    Conservation law: y1 + y2 + y3 = 1 (always!)
+    This is critical for Robertson problem
+    """
+    y_pred = model(t_physics)
+    conservation = torch.sum(y_pred, dim=1, keepdim=True)
+    conservation_loss = torch.mean((conservation - 1.0)**2)
+    return conservation_loss
+
+
+def compute_pinn_data_loss(model, t_data, y_data):
+    """
+    Data loss: How well does network fit the observed data points?
+    """
+    y_pred = model(t_data)
+    data_loss = torch.mean((y_pred - y_data)**2)
+    return data_loss
+
+
+def compute_pinn_ic_loss(model, t0, y0):
+    """
+    Initial condition loss: Network should match initial conditions exactly
+    """
+    y_pred = model(t0)
+    ic_loss = torch.mean((y_pred - y0)**2)
+    return ic_loss
+
+
+def train_robertson_pinn(t_data, y_data, epochs=3000, lr=0.001,
+                         lambda_data=1.0, lambda_physics=0.001, 
+                         lambda_ic=100.0, lambda_conservation=10.0):
+    """
+    Train PINN for Robertson problem with four loss components:
+    1. Data loss: Fit the observed data
+    2. Physics loss: Satisfy the Robertson ODEs
+    3. Initial condition loss: Match initial conditions
+    4. Conservation loss: Enforce y1 + y2 + y3 = 1
+    """
+    model = RobertsonPINN(hidden_size=128)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=200, factor=0.5)
+    
+    # Convert data to tensors
+    t_data_tensor = torch.tensor(t_data.reshape(-1, 1), dtype=torch.float32)
+    y_data_tensor = torch.tensor(y_data, dtype=torch.float32)
+    
+    # Initial conditions
+    t0 = torch.tensor([[0.0]], dtype=torch.float32)
+    y0 = torch.tensor([[y_data[0, 0], y_data[0, 1], y_data[0, 2]]], dtype=torch.float32)
+    
+    # Physics collocation points (logarithmically spaced for stiff problems)
+    n_physics = 2000
+    t_physics_np = np.logspace(-6, np.log10(t_data[-1]), n_physics)
+    t_physics = torch.tensor(t_physics_np.reshape(-1, 1), dtype=torch.float32)
+    
+    losses_total = []
+    losses_data = []
+    losses_physics = []
+    losses_ic = []
+    losses_conservation = []
     
     for epoch in range(epochs):
-        pred = model(t_tensor)
-        loss = criterion(pred, y_tensor)
-        
         optimizer.zero_grad()
-        loss.backward()
+        
+        # Compute all loss components
+        loss_data = compute_pinn_data_loss(model, t_data_tensor, y_data_tensor)
+        loss_physics = compute_robertson_physics_loss(model, t_physics)
+        loss_ic = compute_pinn_ic_loss(model, t0, y0)
+        loss_conservation = compute_robertson_conservation_loss(model, t_physics)
+        
+        # Weighted combination
+        total_loss = (lambda_data * loss_data + 
+                     lambda_physics * loss_physics + 
+                     lambda_ic * loss_ic +
+                     lambda_conservation * loss_conservation)
+        
+        # Backpropagation
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
-        if epoch % 100 == 0:
-            print(f"PINN Epoch {epoch}/{epochs}, Loss: {loss.item():.6f}")
+        # Record losses
+        losses_total.append(total_loss.item())
+        losses_data.append(loss_data.item())
+        losses_physics.append(loss_physics.item())
+        losses_ic.append(loss_ic.item())
+        losses_conservation.append(loss_conservation.item())
+        
+        scheduler.step(total_loss)
+        
+        if epoch % 300 == 0:
+            print(f"PINN Epoch {epoch:4d}/{epochs} | Total: {total_loss.item():.6f} | "
+                  f"Data: {loss_data.item():.6f} | Physics: {loss_physics.item():.2e} | "
+                  f"IC: {loss_ic.item():.2e} | Conservation: {loss_conservation.item():.2e}")
     
-    return model
+    return model, (losses_total, losses_data, losses_physics, losses_ic, losses_conservation)
+
 
 # Run Full Experiment
 def run_experiment(dt=0.01, t_max=10.0, n_samples=30000):
     """Complete experimental pipeline for Robertson problem"""
     
-    print("=" * 60)
-    print("HYBRID ODE SOLVER - ROBERTSON STIFF PROBLEM")
-    print("=" * 60)
+    print("=" * 70)
+    print("HYBRID ODE SOLVER - ROBERTSON STIFF PROBLEM WITH TRUE PINN")
+    print("=" * 70)
     print(f"Problem: Stiff chemical kinetics (3 species)")
     print(f"Time step: {dt}, Max time: {t_max}")
-    print("=" * 60)
+    print("=" * 70)
     
     # Step 1: Generate ground truth (for testing)
     print("\n[1/6] Generating ground truth...")
@@ -227,9 +383,17 @@ def run_experiment(dt=0.01, t_max=10.0, n_samples=30000):
     corr_net, losses = train_correction_network(dataset, epochs=400, batch_size=256)
     print(f"Training complete. Final loss: {losses[-1]:.8f}")
     
-    # Step 4: Train PINN baseline
-    print("\n[4/6] Training PINN baseline...")
-    pinn = train_pinn(t_true, y_true, epochs=1000)
+    # Step 4: Train TRUE PINN
+    print("\n[4/6] Training TRUE PINN (Physics-Informed)...")
+    # Use sparse data for PINN (every 20th point)
+    t_pinn_data = t_true[::20]
+    y_pinn_data = y_true[::20]
+    print(f"PINN training with {len(t_pinn_data)} sparse data points")
+    pinn, pinn_losses = train_robertson_pinn(
+        t_pinn_data, y_pinn_data, epochs=3000, lr=0.001,
+        lambda_data=1.0, lambda_physics=0.001, 
+        lambda_ic=100.0, lambda_conservation=10.0
+    )
     print("PINN training complete")
     
     # Step 5: Rollout all methods
@@ -271,12 +435,12 @@ def run_experiment(dt=0.01, t_max=10.0, n_samples=30000):
         y_hybrid.append(y_next)
     y_hybrid = np.array(y_hybrid)
     
-    # PINN
+    # TRUE PINN - direct prediction
     pinn.eval()
     with torch.no_grad():
         t_pinn = torch.tensor(t_true.reshape(-1, 1), dtype=torch.float32)
         y_pinn = pinn(t_pinn).numpy()
-        # Clip PINN output
+        # Already constrained by sigmoid in network, but clip for safety
         y_pinn = np.clip(y_pinn, 0, 1)
     
     # Step 6: Calculate errors
@@ -285,13 +449,13 @@ def run_experiment(dt=0.01, t_max=10.0, n_samples=30000):
     error_hybrid = np.linalg.norm(y_hybrid - y_true, axis=1)
     error_pinn = np.linalg.norm(y_pinn - y_true, axis=1)
     
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("RESULTS")
-    print("=" * 60)
+    print("=" * 70)
     print(f"Final Error (t={t_max}):")
-    print(f"  RK4:    {error_rk4[-1]:.6f}")
-    print(f"  Hybrid: {error_hybrid[-1]:.6f}")
-    print(f"  PINN:   {error_pinn[-1]:.6f}")
+    print(f"  RK4:         {error_rk4[-1]:.6f}")
+    print(f"  Hybrid:      {error_hybrid[-1]:.6f}")
+    print(f"  TRUE PINN:   {error_pinn[-1]:.6f}")
     
     if error_hybrid[-1] < error_rk4[-1]:
         improvement = (1 - error_hybrid[-1]/error_rk4[-1])*100
@@ -300,18 +464,25 @@ def run_experiment(dt=0.01, t_max=10.0, n_samples=30000):
         degradation = (error_hybrid[-1]/error_rk4[-1] - 1)*100
         print(f"\n⚠ Hybrid degradation: {degradation:.1f}% worse than RK4")
     
+    if error_pinn[-1] < error_rk4[-1]:
+        improvement = (1 - error_pinn[-1]/error_rk4[-1])*100
+        print(f"✓ PINN improvement: {improvement:.1f}% better than RK4")
+    else:
+        degradation = (error_pinn[-1]/error_rk4[-1] - 1)*100
+        print(f"⚠ PINN degradation: {degradation:.1f}% worse than RK4")
+    
     # Print mean errors for better comparison
     print(f"\nMean Error over trajectory:")
-    print(f"  RK4:    {np.mean(error_rk4):.6f}")
-    print(f"  Hybrid: {np.mean(error_hybrid):.6f}")
-    print(f"  PINN:   {np.mean(error_pinn):.6f}")
+    print(f"  RK4:         {np.mean(error_rk4):.6f}")
+    print(f"  Hybrid:      {np.mean(error_hybrid):.6f}")
+    print(f"  TRUE PINN:   {np.mean(error_pinn):.6f}")
     
     # Conservation check
     print(f"\nConservation (y1+y2+y3 at t={t_max}):")
-    print(f"  Truth:  {y_true[-1].sum():.8f}")
-    print(f"  RK4:    {y_rk4[-1].sum():.8f}")
-    print(f"  Hybrid: {y_hybrid[-1].sum():.8f}")
-    print(f"  PINN:   {y_pinn[-1].sum():.8f}")
+    print(f"  Truth:       {y_true[-1].sum():.8f}")
+    print(f"  RK4:         {y_rk4[-1].sum():.8f}")
+    print(f"  Hybrid:      {y_hybrid[-1].sum():.8f}")
+    print(f"  TRUE PINN:   {y_pinn[-1].sum():.8f}")
     
     return {
         't_true': t_true,
@@ -321,44 +492,45 @@ def run_experiment(dt=0.01, t_max=10.0, n_samples=30000):
         'y_pinn': y_pinn,
         'error_rk4': error_rk4,
         'error_hybrid': error_hybrid,
-        'error_pinn': error_pinn
+        'error_pinn': error_pinn,
+        'pinn_losses': pinn_losses
     }
 
 # Visualize Results
 def plot_results(results):
     """Create publication-quality plots for Robertson problem"""
-    fig = plt.figure(figsize=(14, 10))
+    fig = plt.figure(figsize=(16, 12))
     
-    # Create 3x2 grid
-    gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+    # Create 4x2 grid
+    gs = fig.add_gridspec(4, 2, hspace=0.35, wspace=0.3)
     
     # Plot 1: Error vs Time
     ax1 = fig.add_subplot(gs[0, :])
     ax1.plot(results['t_true'], results['error_rk4'], 'r-', label='RK4', linewidth=2, alpha=0.8)
     ax1.plot(results['t_true'], results['error_hybrid'], 'g-', label='Hybrid (RK4 + NN)', linewidth=2, alpha=0.8)
-    ax1.plot(results['t_true'], results['error_pinn'], 'orange', label='PINN', linewidth=2, alpha=0.8)
+    ax1.plot(results['t_true'], results['error_pinn'], 'b-', label='TRUE PINN', linewidth=2, alpha=0.8)
     ax1.set_xlabel('Time', fontsize=12)
     ax1.set_ylabel('L2 Error', fontsize=12)
     ax1.set_title('Error Evolution Over Time - Robertson Problem', fontsize=14, fontweight='bold')
     ax1.legend(fontsize=10)
     ax1.grid(True, alpha=0.3)
     ax1.set_yscale('log')
+    ax1.set_xscale('log')
     
     # Plot 2-4: Individual species trajectories
     species_names = ['y₁ (Species A)', 'y₂ (Species B)', 'y₃ (Species C)']
-    colors_truth = 'black'
     
     for idx, species_name in enumerate(species_names):
         ax = fig.add_subplot(gs[1 + idx//2, idx%2])
         
-        ax.plot(results['t_true'], results['y_true'][:, idx], '--', color=colors_truth, 
+        ax.plot(results['t_true'], results['y_true'][:, idx], 'k--', 
                 label='Ground Truth', linewidth=3, alpha=0.7)
         ax.plot(results['t_true'], results['y_rk4'][:, idx], 'r-', 
                 label='RK4', linewidth=2, alpha=0.6)
         ax.plot(results['t_true'], results['y_hybrid'][:, idx], 'g-', 
                 label='Hybrid', linewidth=2, alpha=0.8)
-        ax.plot(results['t_true'], results['y_pinn'][:, idx], 'orange', 
-                label='PINN', linewidth=2, alpha=0.6)
+        ax.plot(results['t_true'], results['y_pinn'][:, idx], 'b-', 
+                label='TRUE PINN', linewidth=2, alpha=0.8)
         
         ax.set_xlabel('Time', fontsize=11)
         ax.set_ylabel('Concentration', fontsize=11)
@@ -368,8 +540,26 @@ def plot_results(results):
         ax.set_xscale('log')
         ax.set_yscale('log')
     
-    plt.savefig('robertson_hybrid_results.png', dpi=300, bbox_inches='tight')
-    print("\n✓ Saved figure as 'robertson_hybrid_results.png'")
+    # Plot 5: PINN Training Losses
+    ax5 = fig.add_subplot(gs[2:, 1])
+    losses_total, losses_data, losses_physics, losses_ic, losses_conservation = results['pinn_losses']
+    epochs = np.arange(len(losses_total))
+    
+    ax5.plot(epochs, losses_total, 'k-', label='Total Loss', linewidth=2)
+    ax5.plot(epochs, losses_data, 'b-', label='Data Loss', linewidth=1.5, alpha=0.7)
+    ax5.plot(epochs, losses_physics, 'r-', label='Physics Loss', linewidth=1.5, alpha=0.7)
+    ax5.plot(epochs, losses_ic, 'g-', label='IC Loss', linewidth=1.5, alpha=0.7)
+    ax5.plot(epochs, losses_conservation, 'm-', label='Conservation Loss', linewidth=1.5, alpha=0.7)
+    
+    ax5.set_xlabel('Epoch', fontsize=12)
+    ax5.set_ylabel('Loss', fontsize=12)
+    ax5.set_title('PINN Training: Loss Components', fontsize=12, fontweight='bold')
+    ax5.legend(fontsize=9)
+    ax5.grid(True, alpha=0.3)
+    ax5.set_yscale('log')
+    
+    plt.savefig('robertson_true_pinn_results.png', dpi=300, bbox_inches='tight')
+    print("\n✓ Saved figure as 'robertson_true_pinn_results.png'")
     plt.show()
 
 # Run everything
