@@ -567,7 +567,7 @@ if __name__ == "__main__":
     results = run_experiment(
         dt=0.05,          
         t_max=10.0,       
-        n_samples=30000   
+        n_samples=25000   
     )
     
     plot_results(results)

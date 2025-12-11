@@ -457,15 +457,15 @@ def plot_results(results):
     ax.set_yscale('log')
     
     plt.tight_layout()
-    plt.savefig('hybrid_solver_with_true_pinn.png', dpi=300, bbox_inches='tight')
-    print("\n✓ Saved figure as 'hybrid_solver_with_true_pinn.png'")
+    plt.savefig('hybrid_solver_with_true_pinn_better.png', dpi=300, bbox_inches='tight')
+    print("\n✓ Saved figure as 'hybrid_solver_with_true_pinn_better.png'")
     plt.show()
 
 # Run everything
 if __name__ == "__main__":
     results = run_experiment(
-        mu=2.5,           
-        dt=0.25,          
+        mu=25.0,           
+        dt=0.05,          
         t_max=20.0,       
         n_samples=25000   
     )
